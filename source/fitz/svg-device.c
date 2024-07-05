@@ -26,6 +26,8 @@
 #include <float.h>
 #include <math.h>
 
+#define DEBUG_SVG_DEV
+
 typedef struct
 {
 	int pattern;
@@ -49,12 +51,21 @@ typedef struct
 	fz_image *image;
 } image;
 
+typedef struct svg_g_stack
+{
+	struct svg_g_stack *prev;
+	struct svg_g_stack *next;
+	int id;
+	char *data;
+} svg_g_stack;
+
 typedef struct
 {
 	fz_device super;
 
 	int text_as_text;
 	int reuse_images;
+	int use_inkscape_layers;
 
 	fz_output *real_out;
 	int in_defs;
@@ -79,11 +90,190 @@ typedef struct
 	int max_images;
 	image *images;
 
-	int layers;
+	svg_g_stack *target_layers;
+	svg_g_stack *current_layers;
+	svg_g_stack *target_groups;
+	svg_g_stack *current_groups;
+	size_t g_stacks_changed;
 
 	float page_width;
 	float page_height;
 } svg_device;
+
+svg_g_stack *svg_g_stack_push(fz_context *ctx, svg_g_stack *stack, int id, const char *data, size_t data_len)
+{
+	svg_g_stack *layer = fz_malloc(ctx, sizeof(svg_g_stack));
+	layer->data = malloc(data_len+1);
+	strncpy(layer->data, data, data_len+1);
+	layer->id = id;
+
+	layer->prev = stack;
+	if (layer->prev)
+		layer->prev->next = layer;
+	layer->next = NULL;
+
+	return layer;
+};
+
+svg_g_stack *svg_g_stack_pop(fz_context *ctx, svg_g_stack *stack)
+{
+	if (stack){
+		svg_g_stack *layer = stack;
+		if(stack->prev)
+			stack->prev->next = NULL;
+		stack = stack->prev;
+		free(layer->data);
+		fz_free(ctx, layer);
+	}
+	return stack;
+}
+
+svg_g_stack *svg_g_stack_pop_all(fz_context *ctx, svg_g_stack *stack){
+	if(stack)
+		while (stack->next)
+			stack = svg_g_stack_pop(ctx, stack);
+	return stack;
+}
+
+svg_g_stack *svg_g_stack_first(fz_context *ctx, svg_g_stack *stack)
+{
+	svg_g_stack *layer = stack;
+	while (layer && layer->prev) layer = layer->prev;
+	return layer;
+}
+
+void svg_g_stack_print(fz_context *ctx, fz_buffer *buf,char* prefix, svg_g_stack *stack, char* suffix){
+	fz_append_printf(ctx, buf, prefix);
+	if(stack){
+		svg_g_stack *first = svg_g_stack_first(ctx, stack);
+		for(svg_g_stack *layer=first; layer; layer = layer->next){
+			if(layer!=first) fz_append_printf(ctx, buf, ", ");
+			if(layer==stack) fz_append_printf(ctx, buf, "{");
+			fz_append_printf(ctx, buf, "%d", layer->id);
+			if(layer==stack) fz_append_printf(ctx, buf, "}");
+			if(strlen(layer->data))
+				fz_append_printf(ctx, buf, ":`%s`", layer->data);
+		}
+	}
+	else {
+		fz_append_printf(ctx, buf, "null");
+	}
+	fz_append_printf(ctx, buf, suffix);
+}
+
+void svg_g_stack_find_common_prefix(svg_g_stack **a, svg_g_stack **b){
+	while (*b && *a && (*b)->id == (*a)->id) {
+		*b = (*b)->next;
+		*a = (*a)->next;
+	}
+}
+
+
+void push_target_layer(fz_context *ctx, svg_device *sdev, int id, const char *name){
+	sdev->target_layers = svg_g_stack_push(ctx, sdev->target_layers, id, name, strlen(name));
+	sdev->g_stacks_changed++;
+}
+
+void pop_target_layer(fz_context *ctx, svg_device *sdev){
+	sdev->target_layers = svg_g_stack_pop(ctx, sdev->target_layers);
+	sdev->g_stacks_changed++;
+}
+
+void push_target_group(fz_context *ctx, svg_device *sdev, int id, const char *fmt, ...){
+	va_list ap;
+	fz_buffer *buf = fz_new_buffer(ctx, 16);
+	va_start(ap, fmt);
+	fz_append_vprintf(ctx, buf, fmt, ap);
+	va_end(ap);
+	fz_terminate_buffer(ctx, buf);
+	sdev->target_groups = svg_g_stack_push(ctx, sdev->target_groups, id, (const char*)buf->data, buf->len);
+	fz_drop_buffer(ctx, buf);
+	sdev->g_stacks_changed++;
+}
+
+void pop_target_group(fz_context *ctx, svg_device *sdev){
+	sdev->target_groups = svg_g_stack_pop(ctx, sdev->target_groups);
+	sdev->g_stacks_changed++;
+}
+
+void open_layer_g(fz_context* ctx, svg_device *sdev, svg_g_stack* layer){
+	if(sdev->use_inkscape_layers)
+		fz_append_printf(ctx, sdev->main, "<g inkscape:label=\"%s\" inkscape:groupmode=\"layer\"> <!-- layer %d -->\n", layer->data, layer->id);
+	else
+		fz_append_printf(ctx, sdev->main, "<g data-name=\"%s\"> <!-- layer %d -->\n", layer->data, layer->id);
+}
+void close_layer_g(fz_context* ctx, svg_device *sdev, svg_g_stack* layer){
+	fz_append_printf(ctx, sdev->main, "</g> <!-- layer %d -->\n", layer->id);
+}
+
+void open_group_g(fz_context* ctx, svg_device *sdev, svg_g_stack* group){
+	if(strlen(group->data))
+		fz_append_printf(ctx, sdev->main, "<g %s> <!-- group %d -->\n", group->data, group->id);
+	else
+		fz_append_printf(ctx, sdev->main, "<g> <!-- group %d -->\n", group->id);
+}
+void close_group_g(fz_context* ctx, svg_device *sdev, svg_g_stack* group){
+	fz_append_printf(ctx, sdev->main, "</g> <!-- group %d -->\n", group->id);
+}
+
+svg_g_stack * open_gs(fz_context *ctx, svg_device* dev, svg_g_stack *current_items, svg_g_stack *items_to_open, void (*print)(fz_context*, svg_device*, svg_g_stack*)){
+	for(svg_g_stack *item = items_to_open; item; item = item->next){
+		print(ctx, dev, item);
+		current_items = svg_g_stack_push(ctx, current_items, item->id, "", 0); // no need to copy `data`
+	}
+	return current_items;
+}
+
+svg_g_stack * close_gs(fz_context *ctx, svg_device* dev, svg_g_stack *current_items, svg_g_stack *items_to_close, void (*print)(fz_context*, svg_device*, svg_g_stack*)){
+	if(items_to_close){
+		int closed = 0;
+		for(svg_g_stack *item = current_items; item != items_to_close->prev; item = item->prev){
+			print(ctx, dev, item);
+			++closed;
+		}
+		for(int i=0; i<closed; ++i)
+			current_items = svg_g_stack_pop(ctx, current_items);
+	}
+	return current_items;
+}
+
+void svg_emit_g_stacks(fz_context *ctx, svg_device *sdev)
+{
+	if(!sdev->g_stacks_changed)
+		return;
+
+	svg_g_stack *layers_to_close = svg_g_stack_first(ctx, sdev->current_layers);
+	svg_g_stack *layers_to_open = svg_g_stack_first(ctx, sdev->target_layers);
+	svg_g_stack *groups_to_close = svg_g_stack_first(ctx, sdev->current_groups);
+	svg_g_stack *groups_to_open = svg_g_stack_first(ctx, sdev->target_groups);
+
+	/* avoid redundant layer <g>s by finding common prefix between target and actual stacks */
+	svg_g_stack_find_common_prefix(&layers_to_open, &layers_to_close);
+
+	/* if layers haven't changed, avoid redundant group/clip/mask <g>s */
+	if(!layers_to_close && !layers_to_open){
+		svg_g_stack_find_common_prefix(&groups_to_open, &groups_to_close);
+	}
+
+	#ifdef DEBUG_SVG_DEV
+	svg_g_stack_print(ctx, sdev->main, "<!-- current_layers = ", sdev->current_layers, "\n");
+	svg_g_stack_print(ctx, sdev->main, "     target_layers  = ", sdev->target_layers, "\n");
+	svg_g_stack_print(ctx, sdev->main, "     layers_to_close = ", layers_to_close, "\n");
+	svg_g_stack_print(ctx, sdev->main, "     layers_to_open  = ", layers_to_open, " -->\n");
+	svg_g_stack_print(ctx, sdev->main, "<!-- current_groups = ", sdev->current_groups, "\n");
+	svg_g_stack_print(ctx, sdev->main, "     target_groups  = ", sdev->target_groups, "\n");
+	svg_g_stack_print(ctx, sdev->main, "     groups_to_close = ", groups_to_close, "\n");
+	svg_g_stack_print(ctx, sdev->main, "     groups_to_open  = ", groups_to_open, " -->\n");
+	#endif
+
+	sdev->current_groups = close_gs(ctx, sdev, sdev->current_groups, groups_to_close, close_group_g);
+	sdev->current_layers = close_gs(ctx, sdev, sdev->current_layers, layers_to_close, close_layer_g);
+
+	sdev->current_layers = open_gs(ctx, sdev, sdev->current_layers, layers_to_open, open_layer_g);
+	sdev->current_groups = open_gs(ctx, sdev, sdev->current_groups, groups_to_open, open_group_g);
+
+	sdev->g_stacks_changed = 0;
+}
 
 static fz_buffer *
 start_def(fz_context *ctx, svg_device *sdev, int need_tag)
@@ -664,6 +854,8 @@ svg_dev_fill_path(fz_context *ctx, fz_device *dev, const fz_path *path, int even
 	svg_device *sdev = (svg_device*)dev;
 	fz_buffer *out = sdev->out;
 
+	svg_emit_g_stacks(ctx, sdev);
+
 	fz_append_printf(ctx, out, "<path");
 	svg_dev_ctm(ctx, sdev, ctm);
 	svg_dev_path(ctx, sdev, path);
@@ -679,6 +871,8 @@ svg_dev_stroke_path(fz_context *ctx, fz_device *dev, const fz_path *path, const 
 {
 	svg_device *sdev = (svg_device*)dev;
 	fz_buffer *out = sdev->out;
+
+	svg_emit_g_stacks(ctx, sdev);
 
 	fz_append_printf(ctx, out, "<path");
 	svg_dev_ctm(ctx, sdev, ctm);
@@ -705,7 +899,11 @@ svg_dev_clip_path(fz_context *ctx, fz_device *dev, const fz_path *path, int even
 		fz_append_printf(ctx, out, " clip-rule=\"evenodd\"");
 	fz_append_printf(ctx, out, "/>\n</clipPath>\n");
 	out = end_def(ctx, sdev, 0);
-	fz_append_printf(ctx, out, "<g clip-path=\"url(#clip_%d)\">\n", num);
+
+	push_target_group(ctx, sdev, num, "clip-path=\"url(#clip_%d)\"", num);
+	#ifdef DEBUG_SVG_DEV
+	svg_g_stack_print(ctx, sdev->main, "<!-- clip_path() target_groups = ", sdev->target_groups, " -->\n");
+	#endif
 }
 
 static void
@@ -730,7 +928,11 @@ svg_dev_clip_stroke_path(fz_context *ctx, fz_device *dev, const fz_path *path, c
 	svg_dev_path(ctx, sdev, path);
 	fz_append_printf(ctx, out, "/>\n</mask>\n");
 	out = end_def(ctx, sdev, 0);
-	fz_append_printf(ctx, out, "<g mask=\"url(#mask_%d)\">\n", num);
+
+	push_target_group(ctx, sdev, num, "mask=\"url(#mask_%d)\"", num);
+	#ifdef DEBUG_SVG_DEV
+	svg_g_stack_print(ctx, sdev->main, "<!-- clip_stroke_path() target_groups = ", sdev->target_groups, " -->\n");
+	#endif
 }
 
 static void
@@ -741,6 +943,8 @@ svg_dev_fill_text(fz_context *ctx, fz_device *dev, const fz_text *text, fz_matri
 	fz_buffer *out = sdev->out;
 	font *fnt;
 	fz_text_span *span;
+
+	svg_emit_g_stacks(ctx, sdev);
 
 	if (sdev->text_as_text)
 	{
@@ -769,6 +973,8 @@ svg_dev_stroke_text(fz_context *ctx, fz_device *dev, const fz_text *text, const 
 	fz_buffer *out = sdev->out;
 	font *fnt;
 	fz_text_span *span;
+
+	svg_emit_g_stacks(ctx, sdev);
 
 	if (sdev->text_as_text)
 	{
@@ -826,7 +1032,11 @@ svg_dev_clip_text(fz_context *ctx, fz_device *dev, const fz_text *text, fz_matri
 	}
 	fz_append_printf(ctx, out, "</mask>\n");
 	out = end_def(ctx, sdev, 0);
-	fz_append_printf(ctx, out, "<g mask=\"url(#mask_%d)\">\n", num);
+
+	push_target_group(ctx, sdev, num, "mask=\"url(#mask_%d)\"", num);
+	#ifdef DEBUG_SVG_DEV
+	svg_g_stack_print(ctx, sdev->main, "<!-- clip_text() target_groups = ", sdev->target_groups, " -->\n");
+	#endif
 }
 
 static void
@@ -867,7 +1077,11 @@ svg_dev_clip_stroke_text(fz_context *ctx, fz_device *dev, const fz_text *text, c
 	}
 	fz_append_printf(ctx, out, "</mask>\n");
 	out = end_def(ctx, sdev, 0);
-	fz_append_printf(ctx, out, "<g mask=\"url(#mask_%d)\">\n", num);
+
+	push_target_group(ctx, sdev, num, "mask=\"url(#mask_%d)\"", num);
+	#ifdef DEBUG_SVG_DEV
+	svg_g_stack_print(ctx, sdev->main, "<!-- clip_stroke_text() target_groups = ", sdev->target_groups, " -->\n");
+	#endif
 }
 
 static void
@@ -878,6 +1092,8 @@ svg_dev_ignore_text(fz_context *ctx, fz_device *dev, const fz_text *text, fz_mat
 	fz_text_span *span;
 
 	float black[3] = { 0, 0, 0};
+
+	svg_emit_g_stacks(ctx, sdev);
 
 	if (sdev->text_as_text)
 	{
@@ -957,6 +1173,8 @@ svg_dev_fill_image(fz_context *ctx, fz_device *dev, fz_image *image, fz_matrix c
 	scale.a = 1.0f / image->w;
 	scale.d = 1.0f / image->h;
 
+	svg_emit_g_stacks(ctx, sdev);
+
 	local_ctm = fz_concat(scale, ctm);
 	fz_append_printf(ctx, out, "<g");
 	if (alpha != 1.0f)
@@ -993,6 +1211,8 @@ svg_dev_fill_shade(fz_context *ctx, fz_device *dev, fz_shade *shade, fz_matrix c
 	pix = fz_new_pixmap_with_bbox(ctx, fz_device_rgb(ctx), bbox, NULL, 1);
 	fz_clear_pixmap(ctx, pix);
 
+	svg_emit_g_stacks(ctx, sdev);
+
 	fz_try(ctx)
 	{
 		fz_paint_shade(ctx, shade, NULL, ctm, pix, color_params, bbox, NULL, NULL);
@@ -1027,6 +1247,8 @@ svg_dev_fill_image_mask(fz_context *ctx, fz_device *dev, fz_image *image, fz_mat
 	scale.a = 1.0f / image->w;
 	scale.d = 1.0f / image->h;
 
+	svg_emit_g_stacks(ctx, sdev);
+
 	local_ctm = fz_concat(scale, ctm);
 	out = start_def(ctx, sdev, 0);
 	fz_append_printf(ctx, out, "<mask id=\"mask_%d\">\n", mask);
@@ -1059,17 +1281,21 @@ svg_dev_clip_image_mask(fz_context *ctx, fz_device *dev, fz_image *image, fz_mat
 	svg_send_image(ctx, sdev, image, fz_default_color_params/* FIXME */);
 	fz_append_printf(ctx, out, "</g>\n</mask>\n");
 	out = end_def(ctx, sdev, 0);
-	fz_append_printf(ctx, out, "<g mask=\"url(#mask_%d)\">\n", mask);
+
+	push_target_group(ctx, sdev, mask, "mask=\"url(#mask_%d)\"", mask);
+	#ifdef DEBUG_SVG_DEV
+	svg_g_stack_print(ctx, sdev->main, "<!-- clip_image_mask() target_groups = ", sdev->target_groups, " -->\n");
+	#endif
 }
 
 static void
 svg_dev_pop_clip(fz_context *ctx, fz_device *dev)
 {
 	svg_device *sdev = (svg_device*)dev;
-	fz_buffer *out = sdev->out;
-
-	/* FIXME */
-	fz_append_printf(ctx, out, "</g>\n");
+	pop_target_group(ctx, sdev);
+	#ifdef DEBUG_SVG_DEV
+	svg_g_stack_print(ctx, sdev->main, "<!-- pop_clip() target_groups = ", sdev->target_groups, " -->\n");
+	#endif
 }
 
 static void
@@ -1101,14 +1327,17 @@ svg_dev_end_mask(fz_context *ctx, fz_device *dev, fz_function *tr)
 
 	fz_append_printf(ctx, out, "\"/>\n</mask>\n");
 	out = end_def(ctx, sdev, 0);
-	fz_append_printf(ctx, out, "<g mask=\"url(#mask_%d)\">\n", mask);
+
+	push_target_group(ctx, sdev, mask, "mask=\"url(#mask_%d)\"", mask);
+	#ifdef DEBUG_SVG_DEV
+	svg_g_stack_print(ctx, sdev->main, "<!-- end_mask() target_groups = ", sdev->target_groups, " -->\n");
+	#endif
 }
 
 static void
 svg_dev_begin_group(fz_context *ctx, fz_device *dev, fz_rect bbox, fz_colorspace *cs, int isolated, int knockout, int blendmode, float alpha)
 {
 	svg_device *sdev = (svg_device*)dev;
-	fz_buffer *out = sdev->out;
 
 	/* SVG only supports normal/multiply/screen/darken/lighten,
 	 * but we'll send them all, as the spec says that unrecognised
@@ -1139,22 +1368,20 @@ svg_dev_begin_group(fz_context *ctx, fz_device *dev, fz_rect bbox, fz_colorspace
 
 	/* FIXME: Handle alpha == 0 somehow? */
 	/* SVG 1.1 doesn't support adequate blendmodes/knockout etc, so just ignore it for now */
-	if (alpha == 1)
-		fz_append_printf(ctx, out, "<g");
-	else
-		fz_append_printf(ctx, out, "<g opacity=\"%g\"", alpha);
-	if (blendmode != FZ_BLEND_NORMAL)
-		fz_append_printf(ctx, out, " style=\"mix-blend-mode:%s\"", blend_names[blendmode]);
-	fz_append_printf(ctx, out, ">\n");
+	push_target_group(ctx, sdev, sdev->id++, "opacity=\"%g\" style=\"mix-blend-mode:%s\"", alpha, blend_names[blendmode]);
+	#ifdef DEBUG_SVG_DEV
+	fz_append_printf(ctx, sdev->main, "<!-- begin_group() target_groups = ", sdev->target_groups, " -->\n");
+	#endif
 }
 
 static void
 svg_dev_end_group(fz_context *ctx, fz_device *dev)
 {
 	svg_device *sdev = (svg_device*)dev;
-	fz_buffer *out = sdev->out;
-
-	fz_append_printf(ctx, out, "</g>\n");
+	pop_target_group(ctx, sdev);
+	#ifdef DEBUG_SVG_DEV
+	fz_append_printf(ctx, sdev->main, "<!-- end_group() target_groups = ", sdev->target_groups, " -->\n");
+	#endif
 }
 
 static int
@@ -1283,23 +1510,20 @@ static void
 svg_dev_begin_layer(fz_context *ctx, fz_device *dev, const char *name)
 {
 	svg_device *sdev = (svg_device*)dev;
-	fz_buffer *out = sdev->out;
-
-	sdev->layers++;
-	fz_append_printf(ctx, out, "<g id=\"layer_%d\" data-name=\"%s\">\n", sdev->layers, name ? name : "");
+	push_target_layer(ctx, sdev, sdev->id++, name);
+	#ifdef DEBUG_SVG_DEV
+	svg_g_stack_print(ctx, sdev->main, "<!-- begin_layer() target_layers = ", sdev->target_layers, " -->\n");
+	#endif
 }
 
 static void
 svg_dev_end_layer(fz_context *ctx, fz_device *dev)
 {
 	svg_device *sdev = (svg_device*)dev;
-	fz_buffer *out = sdev->out;
-
-	if (sdev->layers == 0)
-		return;
-
-	sdev->layers--;
-	fz_append_printf(ctx, out, "</g>\n");
+	pop_target_layer(ctx, sdev);
+	#ifdef DEBUG_SVG_DEV
+	svg_g_stack_print(ctx, sdev->main, "<!-- end_layer() target_layers = ", sdev->target_layers, " -->\n");
+	#endif
 }
 
 static void
@@ -1308,11 +1532,10 @@ svg_dev_close_device(fz_context *ctx, fz_device *dev)
 	svg_device *sdev = (svg_device*)dev;
 	fz_output *out = sdev->real_out;
 
-	while (sdev->layers > 0)
-	{
-		fz_append_string(ctx, sdev->main, "</g>\n");
-		sdev->layers--;
-	}
+	sdev->target_layers = svg_g_stack_pop_all(ctx, sdev->target_layers);
+	sdev->target_groups = svg_g_stack_pop_all(ctx, sdev->target_groups);
+	sdev->g_stacks_changed++;
+	svg_emit_g_stacks(ctx, sdev);
 
 	if (sdev->save_id)
 		*sdev->save_id = sdev->id;
@@ -1320,6 +1543,8 @@ svg_dev_close_device(fz_context *ctx, fz_device *dev)
 	fz_write_string(ctx, out, "<svg");
 	fz_write_string(ctx, out, " xmlns=\"http://www.w3.org/2000/svg\"");
 	fz_write_string(ctx, out, " xmlns:xlink=\"http://www.w3.org/1999/xlink\"");
+	if(sdev->use_inkscape_layers)
+		fz_write_string(ctx, out, " xmlns:inkscape=\"http://www.inkscape.org/namespaces/inkscape\"");
 	fz_write_string(ctx, out, " version=\"1.1\"");
 	fz_write_printf(ctx, out, " width=\"%g\" height=\"%g\" viewBox=\"0 0 %g %g\">\n",
 		sdev->page_width, sdev->page_height, sdev->page_width, sdev->page_height);
@@ -1402,9 +1627,9 @@ fz_device *fz_new_svg_device_with_id(fz_context *ctx, fz_output *out, float page
 
 	dev->save_id = id;
 	dev->id = id ? *id : 1;
-	dev->layers = 0;
 	dev->text_as_text = (text_format == FZ_SVG_TEXT_AS_TEXT);
 	dev->reuse_images = reuse_images;
+	dev->use_inkscape_layers = 1; // TODO
 	dev->page_width = page_width;
 	dev->page_height = page_height;
 
